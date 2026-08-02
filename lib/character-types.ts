@@ -1,4 +1,19 @@
-export type Character = {
+export type Character = {export type Character = {
+  id: string;
+  name: string;
+  avatar: string | null;
+  persona: string;                  // 角色背景/人设
+  briefPersona?: string; 
+  briefPersonaUpdatedAt?: string;
+  wechatID?: string;     
+  personality?: string;             // 性格特征
+  userRelationship?: string;        // 【新增】与用户的关系（例：青梅竹马/上司与下属）
+  premise?: string;                 // 【新增】前提要领/剧情主线（例：刚吵了一架正想破冰）
+  timeZone?: string;     
+  tags?: string[];
+  createdAt: string;
+  updatedAt: string;
+};
   id: string;
   name: string;
   avatar: string | null; // data URL 或外部 URL
