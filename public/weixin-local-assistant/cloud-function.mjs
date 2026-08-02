@@ -33,12 +33,24 @@ const LOCK_PREFIX = "weixin-cloud/locks";
 const ILINK_BASE = "https://ilinkai.weixin.qq.com";
 const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const BASE_INFO = { channel_version: "1.0.2" };
-const AUTO_REPLY_LOCK_TTL_MS = 15 * 60 * 1000;
+// 锁 TTL 必须远小于「函数被平台掐掉后到下次可重试」的可接受等待：
+// 云函数被墙钟杀掉时 finally 不会执行、锁无法主动释放，只能等 TTL 过期。
+const AUTO_REPLY_LOCK_TTL_MS = 3 * 60 * 1000;
+
+// 单轮回复的截止时间（云端由 pollOnce options.deadlineAt 下发；本地 CLI 无限制）。
+// 用于给 LLM/生图/TTS 分配剩余预算，保证整轮在云函数墙钟内完成。
+let replyDeadlineAt = 0;
+
+function remainingReplyBudgetMs() {
+  if (!replyDeadlineAt) return Number.POSITIVE_INFINITY;
+  return Math.max(0, replyDeadlineAt - Date.now());
+}
 
 const assistantInstanceId = randomUUID();
 
 export async function pollOnce(env, targetBotId, options = {}) {
   const deadlineAt = Number(options?.deadlineAt) || 0;
+  replyDeadlineAt = deadlineAt;
   let skippedForDeadline = 0;
   const index = await loadRuntimeIndex(env);
   const targets = targetBotId
@@ -130,7 +142,11 @@ async function storeIncomingMessage(env, runtime, raw, receivedAt) {
   let imageMime;
   if (mediaItem?.kind === "image") {
     const image = await downloadIncomingWeixinImage(mediaItem).catch((err) => {
-      console.warn(`[weixin-assistant] 收图下载失败 bot=${runtime.bot.id}: ${errorMessage(err)}`);
+      // 打出 image_item 的结构（截断）便于排查微信收图协议差异
+      console.warn(
+        `[weixin-assistant] 收图下载失败 bot=${runtime.bot.id}: ${errorMessage(err)}；`
+        + `image_item=${safeJsonPreview(mediaItem.imageItem, 600)}`,
+      );
       return null;
     });
     if (image) {
@@ -168,8 +184,8 @@ async function storeIncomingMessage(env, runtime, raw, receivedAt) {
 function extractIncomingMediaItem(raw) {
   const items = Array.isArray(raw?.item_list) ? raw.item_list : [];
   for (const item of items) {
-    if (item?.type === 2 && item.image_item?.media) {
-      return { kind: "image", media: item.image_item.media };
+    if (item?.type === 2 && item.image_item) {
+      return { kind: "image", imageItem: item.image_item, media: item.image_item.media };
     }
     if (item?.type === 3) return { kind: "voice" };
     if (item?.type === 4 && item.file_item) {
@@ -188,8 +204,7 @@ async function downloadIncomingWeixinImage(mediaItem) {
   const aesKeyEncoded = mediaItem?.media?.aes_key;
   if (!param || !aesKeyEncoded) throw new Error("missing_incoming_image_params");
 
-  const keyHex = Buffer.from(String(aesKeyEncoded), "base64").toString("utf8").trim();
-  const key = /^[0-9a-fA-F]{32}$/.test(keyHex) ? Buffer.from(keyHex, "hex") : null;
+  const key = decodeIncomingAesKey(aesKeyEncoded);
   if (!key) throw new Error("invalid_incoming_image_key");
 
   const res = await fetchWithTimeout(
@@ -202,11 +217,45 @@ async function downloadIncomingWeixinImage(mediaItem) {
   if (cipherBytes.length === 0 || cipherBytes.length % 16 !== 0) throw new Error("incoming_image_bad_cipher");
   if (cipherBytes.length > INCOMING_IMAGE_MAX_BYTES) throw new Error("incoming_image_too_large");
 
-  const decipher = createDecipheriv("aes-128-ecb", key, null);
-  const bytes = Buffer.concat([decipher.update(cipherBytes), decipher.final()]);
+  // Supabase edge-runtime 的 node:crypto 兼容层不接受 iv=null / Buffer 子类，
+  // 统一传纯 Uint8Array + 零长度 IV（Node 与 Deno 均兼容）。
+  const decipher = createDecipheriv("aes-128-ecb", new Uint8Array(key), new Uint8Array(0));
+  const bytes = Buffer.concat([
+    Buffer.from(decipher.update(new Uint8Array(cipherBytes))),
+    Buffer.from(decipher.final()),
+  ]);
   const mimeType = sniffImageMimeType(bytes);
   if (!mimeType) throw new Error("incoming_image_not_image");
   return { bytes, mimeType };
+}
+
+// 兼容三种可能的 aes_key 编码：base64(hex 字符串)（发送路径用的格式）、
+// 裸 hex 字符串、base64(原始 16 字节)。
+function decodeIncomingAesKey(encoded) {
+  const s = String(encoded || "").trim();
+  if (/^[0-9a-fA-F]{32}$/.test(s)) return Buffer.from(s, "hex");
+  try {
+    const decoded = Buffer.from(s, "base64");
+    if (decoded.length === 16) return decoded;
+    const hex = decoded.toString("utf8").trim();
+    if (/^[0-9a-fA-F]{32}$/.test(hex)) return Buffer.from(hex, "hex");
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+// 序列化对象用于日志排查：长字符串字段只保留长度，整体截断。
+function safeJsonPreview(value, maxLength = 600) {
+  try {
+    const compact = JSON.stringify(value, (jsonKey, jsonValue) => {
+      if (typeof jsonValue === "string" && jsonValue.length > 60) return `<${jsonValue.length} chars>`;
+      return jsonValue;
+    });
+    return String(compact).slice(0, maxLength);
+  } catch {
+    return "(unserializable)";
+  }
 }
 
 function sniffImageMimeType(bytes) {
@@ -240,6 +289,25 @@ async function autoReplyPendingMessages(env, runtime) {
     const replyItems = await buildLocalReplyOutbox(replyText, runtime);
     if (replyItems.length === 0) return { status: "skipped_empty_reply", pending: pending.length, sent: 0 };
 
+    const replyExternalId = `reply_${Date.now()}_raw_${Math.random().toString(36).slice(2)}`;
+    // 首条送达后立刻把待回复消息标记为已回复：媒体回复耗时长，若函数在
+    // 中途被平台掐断，下一轮不会把整段回复重新生成再发一遍（宁可丢
+    // 后续分段，也不重复轰炸对方）。
+    let markedReplied = false;
+    const markPendingReplied = async () => {
+      if (markedReplied) return;
+      markedReplied = true;
+      const repliedAt = new Date().toISOString();
+      for (const item of pending) {
+        await putObject(env, item.path, JSON.stringify({
+          ...item.message,
+          repliedAt,
+          replyExternalId,
+          replyExternalIds: [replyExternalId],
+        }, null, 2), "application/json");
+      }
+    };
+
     const sendResults = [];
     const sendErrors = [];
     for (let i = 0; i < replyItems.length; i += 1) {
@@ -248,6 +316,7 @@ async function autoReplyPendingMessages(env, runtime) {
         const item = replyItems[i];
         const sendResult = await sendLocalReplyItem(runtime.bot?.botToken, latest.raw, item);
         sendResults.push(sendResult);
+        if (sendResults.length === 1) await markPendingReplied();
       } catch (err) {
         sendErrors.push(`第${i + 1}条发送失败: ${errorMessage(err)}`);
       }
@@ -255,22 +324,11 @@ async function autoReplyPendingMessages(env, runtime) {
 
     if (sendResults.length === 0) throw new Error(sendErrors[0] || "send_weixin_reply_failed");
 
-    const replyExternalId = `reply_${Date.now()}_raw_${Math.random().toString(36).slice(2)}`;
     await storeOutgoingMessage(env, runtime, replyExternalId, replyText, {
       sentCount: sendResults.length,
       failedCount: sendErrors.length,
       sendResults,
     });
-
-    const repliedAt = new Date().toISOString();
-    for (const item of pending) {
-      await putObject(env, item.path, JSON.stringify({
-        ...item.message,
-        repliedAt,
-        replyExternalId,
-        replyExternalIds: [replyExternalId],
-      }, null, 2), "application/json");
-    }
 
     return {
       status: sendErrors.length ? "partial_sent" : "sent",
@@ -345,11 +403,17 @@ async function generateReply(env, runtime, cloudMessages, pendingMessages) {
   const messages = normalizeLlmMessages(buildRuntimePromptMessages(runtime, cloudHistory, pendingMessages, imageAttachments));
 
   const request = buildChatCompletionRequest(apiConfig, preset, messages);
-  const res = await fetch(request.url, {
+  // LLM 调用必须有超时：预留 ~30s 给后续的媒体生成与发送。
+  // 超时会抛错并正常释放锁（好过被平台掐掉后锁滞留）。
+  const budget = remainingReplyBudgetMs();
+  const llmTimeoutMs = Number.isFinite(budget)
+    ? Math.min(120_000, Math.max(20_000, budget - 30_000))
+    : 150_000;
+  const res = await fetchWithTimeout(request.url, {
     method: "POST",
     headers: request.headers,
     body: JSON.stringify(request.body),
-  });
+  }, llmTimeoutMs);
   const text = await res.text();
   if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${text.slice(0, 500)}`);
   let data;
@@ -603,7 +667,10 @@ async function buildLocalReplyItemsFromSegment(segment, runtime) {
   const media = findFirstLocalMediaProtocol(value);
   if (!media) return [{ kind: "text", text: value }];
 
-  if (!mediaReplyEnabled) {
+  // 媒体开关：本地 CLI 用 setMediaReplyEnabled（默认开）；云端由运行包
+  // promptContext.mediaReply 下发（随小手机同步自动生效，无需改函数）。
+  const mediaAllowed = mediaReplyEnabled || runtime?.promptContext?.mediaReply === true;
+  if (!mediaAllowed) {
     const out = [];
     const before = value.slice(0, media.index).trim();
     const after = value.slice(media.index + media.raw.length).trim();
@@ -711,11 +778,22 @@ async function generateLocalImageReplyDataUrl(media, runtime) {
   const description = String(media?.label || "").trim();
   if (!config || !description) return "";
 
+  // 剩余预算不足以完成一次生图时直接跳过（外层会降级为照片模板卡），
+  // 保证整轮回复在云函数墙钟内完成、锁能正常释放。
+  const budget = remainingReplyBudgetMs();
+  if (budget < 50_000) {
+    console.warn(`[weixin-assistant] 剩余预算不足（${Math.round(budget / 1000)}s），本轮跳过真实生图，改用照片模板卡`);
+    return "";
+  }
+  const timeoutMs = Number.isFinite(budget)
+    ? Math.min(IMAGE_GENERATION_TIMEOUT_MS, Math.max(20_000, budget - 20_000))
+    : IMAGE_GENERATION_TIMEOUT_MS;
+
   const prompt = mergeImagePrompt(description, config.extraPrompt);
   const referenceImageDataUrl = media.useReferenceImage === true
     ? String(config.referenceImageDataUrl || "").trim()
     : "";
-  return generateImageDataUrlDirect({ config, prompt, referenceImageDataUrl });
+  return generateImageDataUrlDirect({ config, prompt, referenceImageDataUrl, timeoutMs });
 }
 
 function getRuntimeImageGenerationConfig(runtime) {
@@ -742,7 +820,7 @@ function mergeImagePrompt(description, extraPrompt) {
   return extra ? `${main}\n\n${extra}` : main;
 }
 
-async function generateImageDataUrlDirect({ config, prompt, referenceImageDataUrl }) {
+async function generateImageDataUrlDirect({ config, prompt, referenceImageDataUrl, timeoutMs = IMAGE_GENERATION_TIMEOUT_MS }) {
   const hasReference = Boolean(referenceImageDataUrl);
   const url = buildImageGenerationUrl(config.baseUrl, hasReference ? "edits" : "generations");
   const headers = { Authorization: `Bearer ${config.apiKey}` };
@@ -768,7 +846,7 @@ async function generateImageDataUrlDirect({ config, prompt, referenceImageDataUr
     });
   }
 
-  const response = await fetchWithTimeout(url, { method: "POST", headers, body }, IMAGE_GENERATION_TIMEOUT_MS);
+  const response = await fetchWithTimeout(url, { method: "POST", headers, body }, timeoutMs);
   return parseImageGenerationResponseDataUrl(response);
 }
 
@@ -906,19 +984,28 @@ function estimateVoiceDuration(text) {
   return Math.max(2, Math.ceil(String(text || "").length / 4));
 }
 
-const TTS_TIMEOUT_MS = 120_000;
-const IMAGE_GENERATION_TIMEOUT_MS = 180_000;
+// 云函数免费档墙钟上限 150s、单轮预算 120s，媒体生成超时必须压在预算内；
+// 本地助手同用此值（常见生图/TTS 服务 90s 内足够返回）。
+const TTS_TIMEOUT_MS = 60_000;
+const IMAGE_GENERATION_TIMEOUT_MS = 90_000;
 
 async function synthesizeVoiceDataUrl(text, voiceConfig) {
   const cleanText = String(text || "").trim();
   if (!cleanText || !voiceConfig || voiceConfig.enableTTS !== true) return "";
+  // 预算不足时跳过 TTS（外层降级为语音模板卡），保证整轮在墙钟内完成；
+  // 实际请求超时同样按剩余预算收紧（预留 15s 给上传发送），避免擦到墙钟。
+  const budget = remainingReplyBudgetMs();
+  if (budget < 30_000) return "";
+  const timeoutMs = Number.isFinite(budget)
+    ? Math.min(TTS_TIMEOUT_MS, Math.max(10_000, budget - 15_000))
+    : TTS_TIMEOUT_MS;
   const provider = String(voiceConfig.provider || "").trim();
-  if (provider === "Minimax") return synthesizeMinimaxVoiceDataUrl(cleanText, voiceConfig);
-  if (provider === "OpenAI") return synthesizeOpenAIVoiceDataUrl(cleanText, voiceConfig);
+  if (provider === "Minimax") return synthesizeMinimaxVoiceDataUrl(cleanText, voiceConfig, timeoutMs);
+  if (provider === "OpenAI") return synthesizeOpenAIVoiceDataUrl(cleanText, voiceConfig, timeoutMs);
   return "";
 }
 
-async function synthesizeMinimaxVoiceDataUrl(text, config) {
+async function synthesizeMinimaxVoiceDataUrl(text, config, timeoutMs = TTS_TIMEOUT_MS) {
   const apiKey = String(config.apiKey || "").trim();
   if (!apiKey) return "";
   const baseUrl = String(config.baseUrl || "https://api.minimaxi.com/v1").replace(/\/+$/, "");
@@ -946,7 +1033,7 @@ async function synthesizeMinimaxVoiceDataUrl(text, config) {
         channel: 1,
       },
     }),
-  });
+  }, timeoutMs);
   if (!response.ok) return "";
   const data = await response.json().catch(() => null);
   const hex = typeof data?.data?.audio === "string" ? data.data.audio : "";
@@ -959,7 +1046,7 @@ async function synthesizeMinimaxVoiceDataUrl(text, config) {
   return `data:audio/mpeg;base64,${audio.toString("base64")}`;
 }
 
-async function synthesizeOpenAIVoiceDataUrl(text, config) {
+async function synthesizeOpenAIVoiceDataUrl(text, config, timeoutMs = TTS_TIMEOUT_MS) {
   const apiKey = String(config.apiKey || "").trim();
   if (!apiKey) return "";
   const baseUrl = String(config.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
@@ -975,7 +1062,7 @@ async function synthesizeOpenAIVoiceDataUrl(text, config) {
       voice: config.defaultVoice || "alloy",
       response_format: "mp3",
     }),
-  });
+  }, timeoutMs);
   if (!response.ok) return "";
   const bytes = Buffer.from(await response.arrayBuffer());
   if (bytes.length === 0) return "";
@@ -1449,8 +1536,12 @@ function md5(data) {
 }
 
 function encryptAesEcb(plaintext, key) {
-  const cipher = createCipheriv("aes-128-ecb", key, null);
-  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  // 同 downloadIncomingWeixinImage：纯 Uint8Array + 零长度 IV，兼容 Supabase edge-runtime
+  const cipher = createCipheriv("aes-128-ecb", new Uint8Array(key), new Uint8Array(0));
+  return Buffer.concat([
+    Buffer.from(cipher.update(new Uint8Array(plaintext))),
+    Buffer.from(cipher.final()),
+  ]);
 }
 
 function aesEcbPaddedSize(plaintextSize) {
@@ -1541,8 +1632,10 @@ async function loadBucketCore(env) {
     return null;
   }
 }
-// 单次调用的时间预算：Edge Function 免费档墙钟上限 150s，留足回复一个 Bot 的余量。
-const CLOUD_POLL_BUDGET_MS = 120_000;
+// 单次调用的时间预算：Edge Function 免费档墙钟上限 150s。只留 10s 给
+// 收尾动作（状态回写/心跳/响应），把尽量多的时间让给 LLM 与媒体生成，
+// 减少"预算不足降级模板卡"的频率；各环节的内层预留见 assistant-core。
+const CLOUD_POLL_BUDGET_MS = 140_000;
 
 const CLOUD_CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -1665,8 +1758,8 @@ Deno.serve(async (req) => {
   const bucketCore = await loadBucketCore(env);
   const core = bucketCore || { pollOnce, setMediaReplyEnabled };
 
-  // 媒体路径（生图/TTS/CDN 上传加密）尚未在 Deno 环境实测，默认降级为文字；
-  // 定时 SQL 里传 {"media": true} 可显式开启。
+  // 媒体回复开关以运行包 promptContext.mediaReply 为准（随小手机同步下发）；
+  // 请求体传 {"media": true} 可在旧运行包上强制开启。
   core.setMediaReplyEnabled(body?.media === true);
 
   const startedAt = Date.now();

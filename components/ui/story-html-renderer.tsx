@@ -1,6 +1,8 @@
 "use client";
 
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Loader2 } from "lucide-react";
+import { LanguageIcon } from "@heroicons/react/24/solid";
 import { marked } from "marked";
 import { translateReasoningText } from "@/lib/reasoning-translate";
 
@@ -67,8 +69,16 @@ function StoryFoldBlock({ label, content, scopeClass, children }: {
             <summary>
                 {label}
                 {canTranslate && !translation && (
-                    <button type="button" className="story-fold-translate-btn" onClick={handleTranslate}>
-                        {translating ? "翻译中…" : "翻译"}
+                    <button
+                        type="button"
+                        className="story-fold-translate-btn story-fold-translate-icon"
+                        onClick={handleTranslate}
+                        aria-label={translating ? "翻译中" : "翻译"}
+                        title={translating ? "翻译中" : "翻译"}
+                    >
+                        {translating
+                            ? <Loader2 size={13} className="story-fold-icon-spin" aria-hidden="true" />
+                            : <LanguageIcon width={13} height={13} aria-hidden="true" />}
                     </button>
                 )}
                 {canTranslate && translation && (
@@ -232,6 +242,12 @@ function HtmlPageSegment({ html, onOptionSelect, htmlPageMode }: HtmlPageProps) 
     const iframeRef = useRef<HTMLIFrameElement>(null);
     const [height, setHeight] = useState(0);
     const contained = htmlPageMode === "contained";
+    // 高度反馈环检测：生成页里的 100vh/calc(100vh±x) 元素会随 iframe 高度一起
+    // 变高（vh 以 iframe 视口为基准），测量→加高→再测量会无限增长，页面被
+    // 每帧重排（拉到底时贴底逻辑还会跟着每帧强制滚动）。连续多次等步幅递增
+    // 视为反馈环，锁住当前高度；内容真正变矮时解锁。
+    const recentHeightsRef = useRef<{ h: number; t: number }[]>([]);
+    const feedbackLockRef = useRef<number | null>(null);
 
     const srcDoc = useMemo(() => {
         // 高度桥接：照搬黑市剧场那套"按构造稳定"的做法——getBoundingClientRect 测真实
@@ -262,7 +278,41 @@ function HtmlPageSegment({ html, onOptionSelect, htmlPageMode }: HtmlPageProps) 
             if (!e.data || typeof e.data !== "object") return;
             if (iframeRef.current && e.source !== iframeRef.current.contentWindow) return;
             if (e.data.type === "_rhr" && typeof e.data.h === "number") {
-                setHeight(Math.max(e.data.h, 50));
+                const next = Math.max(e.data.h, 50);
+                const lock = feedbackLockRef.current;
+                if (lock !== null) {
+                    if (next <= lock - 8) {
+                        feedbackLockRef.current = null;
+                        recentHeightsRef.current = [];
+                    } else {
+                        return; // 锁定期间忽略继续增高的测量
+                    }
+                }
+                const recent = recentHeightsRef.current;
+                // 桥每次变化会连发多条相同高度的消息，去重后再进窗口
+                if (recent.length === 0 || recent[recent.length - 1].h !== next) {
+                    recent.push({ h: next, t: Date.now() });
+                    if (recent.length > 6) recent.shift();
+                }
+                // 1.2s 内连续 6 次小步幅递增 → 判定为 vh 反馈环（图片逐张加载等
+                // 正常增高没有这么高的频率）
+                const isRunaway = recent.length === 6
+                    && recent[5].t - recent[0].t < 1200
+                    && recent.every((v, i) => {
+                        if (i === 0) return true;
+                        const step = v.h - recent[i - 1].h;
+                        return step > 0 && step < 400;
+                    });
+                if (isRunaway) {
+                    // vh 内容想占满视口，锁一个接近整屏的稳定高度而不是初始小值
+                    const viewport = iframeRef.current?.closest(".story-stage")?.clientHeight
+                        || (typeof window !== "undefined" ? window.innerHeight : 600);
+                    const locked = Math.max(recent[0].h, Math.round(viewport * 0.68));
+                    feedbackLockRef.current = locked;
+                    setHeight(locked);
+                    return;
+                }
+                setHeight(next);
             }
             if (e.data.type === "_rhr_opt" && typeof e.data.text === "string") {
                 onOptionSelect?.(e.data.text);

@@ -41,8 +41,10 @@ async function loadBucketCore(env) {
     return null;
   }
 }
-// 单次调用的时间预算：Edge Function 免费档墙钟上限 150s，留足回复一个 Bot 的余量。
-const CLOUD_POLL_BUDGET_MS = 120_000;
+// 单次调用的时间预算：Edge Function 免费档墙钟上限 150s。只留 10s 给
+// 收尾动作（状态回写/心跳/响应），把尽量多的时间让给 LLM 与媒体生成，
+// 减少"预算不足降级模板卡"的频率；各环节的内层预留见 assistant-core。
+const CLOUD_POLL_BUDGET_MS = 140_000;
 
 const CLOUD_CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -165,8 +167,8 @@ Deno.serve(async (req) => {
   const bucketCore = await loadBucketCore(env);
   const core = bucketCore || { pollOnce, setMediaReplyEnabled };
 
-  // 媒体路径（生图/TTS/CDN 上传加密）尚未在 Deno 环境实测，默认降级为文字；
-  // 定时 SQL 里传 {"media": true} 可显式开启。
+  // 媒体回复开关以运行包 promptContext.mediaReply 为准（随小手机同步下发）；
+  // 请求体传 {"media": true} 可在旧运行包上强制开启。
   core.setMediaReplyEnabled(body?.media === true);
 
   const startedAt = Date.now();

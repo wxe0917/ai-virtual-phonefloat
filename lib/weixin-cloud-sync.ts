@@ -51,7 +51,6 @@ import {
 } from "./chat-engine";
 import { nativeToolProtocolForConfig } from "./llm-provider-adapter";
 import { getEnabledTools } from "./tool-storage";
-import { formatToolsForPrompt } from "./tool-prompt";
 import { getCustomStickerExample, getCustomStickerNames, resolveCustomStickerMap } from "./custom-sticker-storage";
 import { getChatImageFromIndexedDB } from "./chat-asset-storage";
 import { buildCalendarScheduleMarker, getCurrentCalendarScheduleForPrompt } from "./calendar-storage";
@@ -150,6 +149,8 @@ export type WeixinCloudPromptContext = {
   offlineBilingualInstruction: string;
   offlineSummaryTag: string;
   enableVision: boolean;
+  /** 云端助手是否发送媒体回复（生图/表情包/语音卡）；核心模块按此开关执行 */
+  mediaReply?: boolean;
   timeAware: boolean;
   nativeToolHistory: boolean;
 };
@@ -395,22 +396,21 @@ export async function deployWeixinCloudFunction(accessToken: string): Promise<vo
   if (!codeRes.ok) throw new Error("获取云函数代码失败，请刷新页面重试。");
   const code = await codeRes.text();
 
-  const form = new FormData();
-  form.append("metadata", JSON.stringify({
-    name: WEIXIN_CLOUD_FUNCTION_SLUG,
-    entrypoint_path: "index.ts",
-    verify_jwt: false,
-  }));
-  form.append("file", new Blob([code], { type: "application/typescript" }), "index.ts");
-
+  // 经站点服务端代理转发（/api/weixin/deploy-function）：api.supabase.com
+  // 不对第三方站点来源返回 CORS 放行头，浏览器直连会被拦截，与 iLink
+  // 走 /api/weixin 代理是同一类问题。token 仅透传，服务端不存储不记录。
   let res: Response;
   try {
-    res = await fetch(
-      `https://api.supabase.com/v1/projects/${ref}/functions/deploy?slug=${WEIXIN_CLOUD_FUNCTION_SLUG}`,
-      { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form },
-    );
+    res = await fetch("/api/weixin/deploy-function", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ref, token, code }),
+    });
   } catch {
-    throw new Error("无法访问 Supabase 管理接口，请检查网络后重试。");
+    throw new Error("无法访问站点部署接口，请检查网络后重试；也可改用下方「手动部署方式」。");
+  }
+  if (res.status === 502) {
+    throw new Error("服务器暂时连不上 Supabase 管理接口，请稍后重试；也可改用下方「手动部署方式」。");
   }
 
   if (res.status === 401) {
@@ -860,9 +860,10 @@ async function buildWeixinCloudPromptContext(params: {
   ]);
 
   const now = new Date();
-  const toolsPrompt = usesNativeActions
-    ? "<available_actions>\n需要动作时，可展开对应类别的动作说明；已有具体动作说明时，直接调用具体动作。\n</available_actions>"
-    : formatToolsForPrompt(enabledTools);
+  // 微信链路没有工具执行引擎（原生 tool_calls 不解析、文本指令会被清理），
+  // 不下发工具清单/动作横幅，改为明确声明不可用；历史中的工具调用回合
+  // 保留在上下文里（承载剧情连续性），靠声明约束模型不去模仿。
+  const toolsPrompt = "<tool_availability>当前对话正通过微信进行：工具/动作系统不可用。不要输出「获取指令」「执行动作」或任何工具调用格式的内容，也不要模仿历史消息中的工具调用记录，直接以普通对话完成回应。</tool_availability>";
 
   const promptContext: WeixinCloudPromptContext = {
     appId,
@@ -903,6 +904,7 @@ async function buildWeixinCloudPromptContext(params: {
       ),
     offlineSummaryTag: params.preset?.story_summary_tag?.trim() || "summary",
     enableVision: params.apiConfig.enableImageRecognition === true,
+    mediaReply: true,
     timeAware: params.chatAppSettings.timeAware !== false,
     nativeToolHistory: usesNativeActions,
   };

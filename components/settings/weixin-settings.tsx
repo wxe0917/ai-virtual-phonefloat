@@ -757,8 +757,8 @@ export function WeixinSettings({ onOpenDataManagement }: { onOpenDataManagement?
                             <span className="mt-0.5 flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full bg-black text-[11px] font-extrabold text-white">2</span>
                             <div className="flex min-w-0 flex-1 flex-col gap-1.5">
                                 <span className="text-[13px] font-bold leading-snug text-[var(--c-text)]">一键部署云函数</span>
-                                <span className="menu-desc !mt-0">① 打开 supabase.com → 右上角头像 → Account Settings → 「Access Tokens」→ 点「Generate new token」（名字随意）→ 复制生成的 token；</span>
-                                <span className="menu-desc !mt-0">② 粘贴到下方，点「一键部署」。Token 只用这一次、不会被保存，部署时会自动关闭 JWT 校验。</span>
+                                <span className="menu-desc !mt-0">① 打开 supabase.com → 点右上角<b>头像</b> → 选「Account」进入账户设置 → 再点右上角<b>三横线（☰）菜单</b> → 「Access Tokens」→ 点「Generate new token」（名字随意）→ 复制生成的 token。也可以直接访问 supabase.com/dashboard/account/tokens；</span>
+                                <span className="menu-desc !mt-0">② 粘贴到下方，点「一键部署」。Token 只用这一次，经本站点服务端转发给 Supabase（不存储、不记录），部署时会自动关闭 JWT 校验。用完可随时在 Supabase 里 Revoke。</span>
                                 <span className="menu-desc !mt-0">📌 只需部署这一次：之后小手机每次同步运行包都会把最新逻辑传到云端，函数自动使用。</span>
                                 <input
                                     type="password"
@@ -921,7 +921,7 @@ export function WeixinSettings({ onOpenDataManagement }: { onOpenDataManagement?
                             <span className="menu-desc !mt-0">· 冷启动：刚部署或停用较久后重新开启时，微信侧要几分钟才把 Bot 恢复为在线，期间回复慢、可能显示「暂无法连接」；停用期间收到的消息不会补发。让定时任务一直跑着就不会再遇到。</span>
                             <span className="menu-desc !mt-0">· 与本地助手共用同一套逻辑和防重复锁，可同时开启互为备份。</span>
                             <span className="menu-desc !mt-0">· 对方发来的图片：在 API 设置开启「图像识别」后角色可以看到并回应（遵循聊天信息页的传入图片数），图片也会同步回小手机显示；语音和文件暂以文字占位提示。</span>
-                            <span className="menu-desc !mt-0">· 角色发出的媒体：目前云端版把照片、语音等媒体协议降级为文字发送。</span>
+                            <span className="menu-desc !mt-0">· 角色发出的媒体：支持生图照片（遵循小手机「图像生成」设置）、表情包与语音（遵循语音配置），与本地助手一致。</span>
                             <span className="menu-desc !mt-0">· 微信 token 过期后仍需回到小手机重新扫码。</span>
                             <span className="menu-desc !mt-0">· 角色、API、预设等变更后，记得重新同步运行包。</span>
                             <span className="menu-desc !mt-0">· 停用：步骤②的「停用」按钮，停用后零配额消耗；也可在 SQL Editor 执行 select cron.unschedule(&apos;{WEIXIN_CLOUD_CRON_JOB_NAME}&apos;);</span>
