@@ -138,7 +138,22 @@ export function createCharacter(
 // ── JSON import/export ───────────────────────────────
 
 export function exportCharacterAsJson(char: Character): void {
+  const payload = {export function exportCharacterAsJson(char: Character): void {
   const payload = {
+    schema: "ai_phone_character",
+    schema_version: "1.0",
+    name: char.name,
+    description: char.persona,
+    personality: char.personality || "",
+    userRelationship: char.userRelationship || "", // 【新增】
+    premise: char.premise || "",                   // 【新增】
+    avatar: char.avatar ?? "none",
+    tags: char.tags || [],
+    wechatID: char.wechatID || "",
+    timeZone: char.timeZone || "",
+  };
+  // ...
+  }
     schema: "ai_phone_character",
     schema_version: "1.0",
     name: char.name,
