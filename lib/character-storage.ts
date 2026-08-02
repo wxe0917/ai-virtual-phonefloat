@@ -138,7 +138,22 @@ export function createCharacter(
 // ── JSON import/export ───────────────────────────────
 
 export function exportCharacterAsJson(char: Character): void {
+  const payload = {export function exportCharacterAsJson(char: Character): void {
   const payload = {
+    schema: "ai_phone_character",
+    schema_version: "1.0",
+    name: char.name,
+    description: char.persona,
+    personality: char.personality || "",
+    userRelationship: char.userRelationship || "", // 【新增】
+    premise: char.premise || "",                   // 【新增】
+    avatar: char.avatar ?? "none",
+    tags: char.tags || [],
+    wechatID: char.wechatID || "",
+    timeZone: char.timeZone || "",
+  };
+  // ...
+  }
     schema: "ai_phone_character",
     schema_version: "1.0",
     name: char.name,
@@ -183,7 +198,17 @@ export function parseCharacterFromJson(
       throw new Error(CHAR_BLOCKED_FIELDS);
     }
 
-    return {
+    return {return {
+  name: String(src.name ?? ""),
+  persona: String(src.description ?? src.persona ?? ""),
+  avatar: validAvatar(src.avatar),
+  personality: typeof src.personality === "string" && src.personality.trim() ? src.personality : undefined,
+  userRelationship: typeof src.userRelationship === "string" && src.userRelationship.trim() ? src.userRelationship : undefined, // 【新增】
+  premise: typeof src.premise === "string" && src.premise.trim() ? src.premise : undefined,                         // 【新增】
+  tags: Array.isArray(src.tags) ? src.tags.map(String) : [],
+  wechatID: typeof src.wechatID === "string" && src.wechatID.trim() ? src.wechatID : undefined,
+  timeZone: normalizeTimeZone(src.timeZone ?? src.timezone ?? src.time_zone),
+};
       name: String(src.name ?? ""),
       persona: String(src.description ?? src.persona ?? ""),
       avatar: validAvatar(src.avatar),
